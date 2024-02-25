@@ -1,0 +1,118 @@
+#!/usr/bin/env swift
+
+import Foundation
+
+var success = true
+let fileSize = 50 * 1024 * 1024
+let gigabyte = 1024 * 1024 * 1024
+
+func setupTestEnvironment() -> URL {
+    let fileManager = FileManager.default
+    let temporaryDirectoryURL = fileManager.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    try? fileManager.createDirectory(at: temporaryDirectoryURL, withIntermediateDirectories: true)
+    return temporaryDirectoryURL
+}
+
+func createTestFiles(in directory: URL, numberOfFiles: Int, fileSize: Int) {
+    for fileIndex in 1...numberOfFiles {
+        let fileName = String(format: "file%02d.txt", fileIndex)
+        let fileURL = directory.appendingPathComponent(fileName)
+        FileManager.default.createFile(atPath: fileURL.path, contents: Data(repeating: UInt8(fileIndex), count: fileSize))
+    }
+}
+
+func executeTrashSweeper(withArguments arguments: [String]) -> String {
+    let process = Process()
+    let outputPipe = Pipe()
+    process.executableURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent("trashsweeper")
+    process.arguments = arguments
+    process.standardOutput = outputPipe
+    process.standardError = outputPipe
+    try? process.run()
+    process.waitUntilExit()
+    let outputData = outputPipe.fileHandleForReading.readDataToEndOfFile()
+    return String(data: outputData, encoding: .utf8) ?? ""
+}
+
+func cleanupTestEnvironment(at directory: URL) {
+    let fileManager = FileManager.default
+    try? fileManager.removeItem(at: directory)
+}
+
+func getAvailableDiskSpace(for directory: URL) -> Int64 {
+    let fileSystemAttributes = try? FileManager.default.attributesOfFileSystem(forPath: directory.path)
+    return fileSystemAttributes?[.systemFreeSize] as? Int64 ?? 0
+}
+
+func performIntegrationTest(named testName: String, failureMessage: String, numberOfFiles: Int = 0, fileSize: Int = fileSize, testAction: (URL) -> Bool) {
+    let testDirectoryURL = setupTestEnvironment()
+    defer { cleanupTestEnvironment(at: testDirectoryURL) }
+    
+    if numberOfFiles > 0 {
+        createTestFiles(in: testDirectoryURL, numberOfFiles: numberOfFiles, fileSize: fileSize)
+    }
+    
+    if !testAction(testDirectoryURL) {
+        print("\(testName) failed: \(failureMessage)")
+        success = false
+    }
+}
+
+func runIntegrationTests() {
+    performIntegrationTest(named: "HelpOptionTest", failureMessage: "Help usage missing", numberOfFiles: 0) { _ in
+        executeTrashSweeper(withArguments: ["-h"]).contains("Usage:")
+    }
+
+    performIntegrationTest(named: "VersionOptionTest", failureMessage: "Version information missing", numberOfFiles: 0) { _ in
+        executeTrashSweeper(withArguments: ["-v"]).contains("version 1.0")
+    }
+
+    performIntegrationTest(named: "QuietModeTest", failureMessage: "Expected no output", numberOfFiles: 0) { directory in
+        executeTrashSweeper(withArguments: ["-q", "-p", directory.path]).isEmpty
+    }
+
+    performIntegrationTest(named: "DryRunTest", failureMessage: "Files were modified", numberOfFiles: 5, fileSize: 1024) { directory in
+        let initialFileList = try? FileManager.default.contentsOfDirectory(atPath: directory.path)
+        _ = executeTrashSweeper(withArguments: ["-d", "-p", directory.path])
+        let finalFileList = try? FileManager.default.contentsOfDirectory(atPath: directory.path)
+        return initialFileList?.elementsEqual(finalFileList ?? []) ?? false
+    }
+
+    performIntegrationTest(named: "CleanupThresholdTest", failureMessage: "Cleanup did not occur as expected", numberOfFiles: 5, fileSize: 1024) { directory in
+        let freeSpaceBeforeTest = getAvailableDiskSpace(for: directory)
+        let totalFilesSize = Int64(5 * 1024)
+        let thresholdInGigabytes = (Double(freeSpaceBeforeTest) + Double(totalFilesSize) / 2) / Double(gigabyte)
+        let initialFileList = try? FileManager.default.contentsOfDirectory(atPath: directory.path)
+        _ = executeTrashSweeper(withArguments: ["-t", "\(thresholdInGigabytes)", "-p", directory.path])
+        let finalFileList = try? FileManager.default.contentsOfDirectory(atPath: directory.path)
+        return !(initialFileList?.elementsEqual(finalFileList ?? []) ?? false)
+    }
+
+    performIntegrationTest(named: "InvalidPathTest", failureMessage: "Error not handled correctly", numberOfFiles: 0) { _ in
+        executeTrashSweeper(withArguments: ["-p", "/invalid/path"]).contains("Error")
+    }
+
+    performIntegrationTest(named: "FileDeletionOrderTest", failureMessage: "Incorrect file deletion order", numberOfFiles: 20) { directory in
+        let initialFileList = try? FileManager.default.contentsOfDirectory(atPath: directory.path).sorted()
+        let totalFilesSize = Int64(20 * fileSize)
+        let freeSpaceBeforeTest = getAvailableDiskSpace(for: directory)
+        let thresholdInGigabytes = (Double(freeSpaceBeforeTest) + Double(totalFilesSize) / 2) / Double(gigabyte)
+        _ = executeTrashSweeper(withArguments: ["-t", "\(thresholdInGigabytes)", "-p", directory.path])
+        let remainingFileList = try? FileManager.default.contentsOfDirectory(atPath: directory.path).sorted()
+        let filesDeletedCorrectly = initialFileList?.suffix(remainingFileList?.count ?? 0).elementsEqual(remainingFileList ?? []) ?? false
+        if !filesDeletedCorrectly {
+            print("Initial file list: \(String(describing: initialFileList))")
+            print("Remaining file list: \(String(describing: remainingFileList))")
+        }
+        return filesDeletedCorrectly
+    }
+
+    if !success {
+        print("Some integration tests failed")
+    } else {
+        print("All integration tests passed successfully")
+    }
+}
+
+runIntegrationTests()
+
